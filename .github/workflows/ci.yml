@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  selftest:
+    name: selftest (odoo ${{ matrix.odoo }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        odoo: ["18", "19"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Passing fixture passes (via the composite action)
+        uses: ./
+        with:
+          odoo-version: ${{ matrix.odoo }}
+          dir: tests/fixtures/runner_selftest_ok
+          upgrade-test: "true"
+
+      - name: Failing fixture fails with exit code 1
+        run: |
+          set +e
+          ./odoo-runner --dir tests/fixtures/runner_selftest_fail --odoo "${{ matrix.odoo }}"
+          rc=$?
+          set -e
+          if [[ "${rc}" -ne 1 ]]; then
+            echo "expected exit 1 from the failing fixture, got ${rc}" >&2
+            exit 1
+          fi
+
+      - name: No leftover docker resources
+        run: |
+          leftovers=$(docker ps -aq --filter label=odoo-runner=1; docker network ls -q --filter label=odoo-runner=1)
+          if [[ -n "${leftovers}" ]]; then
+            echo "odoo-runner left docker resources behind:" >&2
+            docker ps -a --filter label=odoo-runner=1 >&2
+            docker network ls --filter label=odoo-runner=1 >&2
+            exit 1
+          fi
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uvx ruff check odoo-runner
+      - run: uvx ruff format --check odoo-runner

@@ -1,0 +1,963 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.13"
+# dependencies = []
+# ///
+"""odoo-runner: disposable Docker runner for Odoo module tests, demos, and shells.
+
+Spins up a throwaway Odoo + Postgres pair in Docker, installs the target
+module(s), and reports a pass/fail verdict via exit code. Also supports a
+live demo server and an interactive `odoo shell`. Modules are always
+mounted read-only; this is not a development server.
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+import dataclasses
+import hashlib
+import os
+import platform
+import re
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from pathlib import Path
+
+# --- Constants ---------------------------------------------------------
+
+LABEL_KEY = "odoo-runner"
+LABEL_VALUE = "1"
+LABEL_ARG = f"{LABEL_KEY}={LABEL_VALUE}"
+
+# Bump this to invalidate every derived-image hash tag when the Dockerfile
+# template below changes shape (independent of odoo version/requirements).
+DOCKERFILE_TEMPLATE_VERSION = "1"
+
+PG_IMAGE = "postgres:18"
+PG_WAIT_TIMEOUT_S = 60
+PG_WAIT_INTERVAL_S = 0.5
+CHROME_DEB_URL = (
+    "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb"
+)
+
+EXIT_PASS = 0
+EXIT_TEST_FAILURE = 1
+EXIT_USAGE_ERROR = 2
+EXIT_INFRA_ERROR = 3
+
+LOG_LINE_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3} \d+ "
+    r"(?P<level>\w+) (?P<db>\S+) (?P<logger>[\w.]+): (?P<msg>.*)$"
+)
+
+DOCKERFILE_TEMPLATE = """\
+FROM odoo:{version}
+USER root
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
+{browser_layer}{requirements_layer}
+USER odoo
+"""
+
+BROWSER_LAYER = """\
+RUN apt-get update \\
+    && apt-get install -y --no-install-recommends curl ca-certificates \\
+    && curl -fsSL -o /tmp/google-chrome.deb {chrome_url} \\
+    && apt-get install -y --no-install-recommends /tmp/google-chrome.deb \\
+    && rm -rf /tmp/google-chrome.deb /var/lib/apt/lists/*
+# Odoo's HttpCase ChromeBrowser talks to Chrome's devtools protocol over a
+# websocket; it SkipTests without Chrome present AND without this package,
+# so both are required for --browser to actually exercise HttpCase/tours.
+RUN pip3 install --no-cache-dir websocket-client
+"""
+
+REQUIREMENTS_LAYER = """\
+COPY requirements.txt /tmp/requirements.txt
+RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
+"""
+
+
+class ConfigError(Exception):
+    """Bad CLI input or resolved configuration. Maps to exit code 2."""
+
+
+class InfraError(Exception):
+    """Docker/postgres/image infrastructure failure. Maps to exit code 3."""
+
+
+# --- Config --------------------------------------------------------------
+
+
+@dataclasses.dataclass
+class Config:
+    """Fully resolved run configuration (CLI > env > .env > default)."""
+
+    dir: Path
+    modules: list[str] | None
+    requirements: Path | None
+    odoo_version: str
+    mode: str  # "test" | "demo" | "shell"
+    test_tags: str | None
+    upgrade_test: bool
+    browser: bool
+    port: int | None
+    persist: bool
+    fresh: bool
+    rebuild: bool
+    verbose: bool
+    dry_run: bool
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    """Parse a tiny KEY=VALUE .env file. No interpolation, no `export`."""
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for raw_line in path.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        values[key] = value
+    return values
+
+
+def _resolve(cli_value: str | None, env_key: str, dotenv: dict[str, str]) -> str | None:
+    """CLI > process env > .env file > None, per the locked precedence order."""
+    if cli_value is not None:
+        return cli_value
+    if env_key in os.environ:
+        return os.environ[env_key]
+    return dotenv.get(env_key)
+
+
+def sanitize_docker_name(name: str) -> str:
+    """Make a string safe to use in docker resource/tag names."""
+    cleaned = re.sub(r"[^a-zA-Z0-9_.-]", "-", name).strip("-")
+    return cleaned.lower() or "project"
+
+
+def detect_addons_dir(dir_arg: Path) -> tuple[Path, list[str] | None]:
+    """Return (addons_dir, forced_single_module_list_or_None).
+
+    If --dir points directly at a module (has __manifest__.py), the addons
+    dir is its parent and the module list is forced to just that module.
+    Otherwise --dir is treated as an addons dir whose immediate children are
+    scanned for modules.
+    """
+    resolved = dir_arg.resolve()
+    manifest = resolved / "__manifest__.py"
+    if manifest.is_file():
+        return resolved.parent, [resolved.name]
+    return resolved, None
+
+
+def discover_modules(addons_dir: Path) -> list[str]:
+    """Scan immediate children for installable Odoo modules."""
+    modules = []
+    for child in sorted(addons_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        manifest_path = child / "__manifest__.py"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = ast.literal_eval(manifest_path.read_text())
+        except (SyntaxError, ValueError):
+            continue
+        if manifest.get("installable", True) is False:
+            continue
+        modules.append(child.name)
+    return modules
+
+
+def build_config(args: argparse.Namespace) -> tuple[Config, Path, list[str]]:
+    """Resolve CLI args + env + .env into a Config, addons_dir, and module list."""
+    dir_arg = Path(args.dir or ".").resolve()
+    if not dir_arg.is_dir():
+        raise ConfigError(f"--dir {dir_arg} does not exist or is not a directory")
+
+    addons_dir, forced_modules = detect_addons_dir(dir_arg)
+    dotenv = parse_env_file(dir_arg / ".env")
+
+    odoo_version = _resolve(args.odoo, "ODOO_RUNNER_ODOO_VERSION", dotenv)
+    if odoo_version is None:
+        odoo_version = "latest"
+        print(
+            "warning: no --odoo version given and ODOO_RUNNER_ODOO_VERSION is unset; "
+            "defaulting to 'latest'",
+            file=sys.stderr,
+        )
+
+    browser_raw = _resolve("1" if args.browser else None, "ODOO_RUNNER_BROWSER", dotenv)
+    browser = (
+        str(browser_raw).strip().lower() in ("1", "true", "yes", "on")
+        if browser_raw
+        else False
+    )
+
+    port_raw = _resolve(
+        str(args.port) if args.port is not None else None, "ODOO_RUNNER_PORT", dotenv
+    )
+    port = int(port_raw) if port_raw is not None else None
+
+    test_tags = _resolve(args.test_tags, "ODOO_RUNNER_TEST_TAGS", dotenv)
+
+    if args.modules:
+        modules = [m.strip() for m in args.modules.split(",") if m.strip()]
+        for module in modules:
+            if not (addons_dir / module / "__manifest__.py").is_file():
+                raise ConfigError(f"module '{module}' not found under {addons_dir}")
+    elif forced_modules is not None:
+        modules = forced_modules
+    else:
+        modules = discover_modules(addons_dir)
+        if not modules:
+            raise ConfigError(f"no installable modules found under {addons_dir}")
+
+    if args.requirements:
+        requirements = Path(args.requirements).resolve()
+        if not requirements.is_file():
+            raise ConfigError(f"--requirements {requirements} does not exist")
+    else:
+        candidate = dir_arg / "requirements.txt"
+        requirements = candidate if candidate.is_file() else None
+
+    if browser and platform.machine() not in ("x86_64", "amd64", "AMD64"):
+        raise ConfigError(
+            f"--browser needs the Google Chrome amd64 .deb; this machine reports "
+            f"'{platform.machine()}', which is unsupported in v1"
+        )
+
+    mode = "demo" if args.demo else "shell" if args.shell else "test"
+
+    config = Config(
+        dir=dir_arg,
+        modules=modules,
+        requirements=requirements,
+        odoo_version=odoo_version,
+        mode=mode,
+        test_tags=test_tags,
+        upgrade_test=args.upgrade_test,
+        browser=browser,
+        port=port,
+        persist=args.persist,
+        fresh=args.fresh,
+        rebuild=args.rebuild,
+        verbose=args.verbose,
+        dry_run=args.dry_run,
+    )
+    return config, addons_dir, modules
+
+
+# --- Docker plumbing -------------------------------------------------------
+
+
+def docker_available() -> bool:
+    if shutil.which("docker") is None:
+        return False
+    result = subprocess.run(["docker", "info"], capture_output=True, check=False)
+    return result.returncode == 0
+
+
+def image_exists(tag: str) -> bool:
+    result = subprocess.run(
+        ["docker", "image", "inspect", tag], capture_output=True, check=False
+    )
+    return result.returncode == 0
+
+
+def ensure_image_pulled(tag: str) -> None:
+    if image_exists(tag):
+        return
+    print(f"pulling {tag} ...", file=sys.stderr)
+    result = subprocess.run(["docker", "pull", tag], check=False)
+    if result.returncode != 0:
+        raise InfraError(f"failed to pull image {tag}")
+
+
+def compute_image_tag(version: str, browser: bool, requirements: Path | None) -> str:
+    """Pure function: resolves the image tag odoo-runner would use, no side effects."""
+    if requirements is None and not browser:
+        return f"odoo:{version}"
+    req_bytes = requirements.read_bytes() if requirements else b""
+    hasher = hashlib.sha256()
+    hasher.update(DOCKERFILE_TEMPLATE_VERSION.encode())
+    hasher.update(version.encode())
+    hasher.update(b"browser" if browser else b"no-browser")
+    hasher.update(req_bytes)
+    hash8 = hasher.hexdigest()[:8]
+    suffix = "-browser" if browser else ""
+    return f"odoo-runner:{version}{suffix}-{hash8}"
+
+
+def build_image(
+    tag: str, version: str, browser: bool, requirements: Path | None, rebuild: bool
+) -> None:
+    dockerfile = DOCKERFILE_TEMPLATE.format(
+        version=version,
+        browser_layer=BROWSER_LAYER.format(chrome_url=CHROME_DEB_URL)
+        if browser
+        else "",
+        requirements_layer=REQUIREMENTS_LAYER if requirements else "",
+    )
+    with tempfile.TemporaryDirectory(prefix="odoo-runner-build-") as tmp:
+        tmp_path = Path(tmp)
+        (tmp_path / "Dockerfile").write_text(dockerfile)
+        if requirements:
+            shutil.copy(requirements, tmp_path / "requirements.txt")
+        cmd = ["docker", "build", "-t", tag]
+        if rebuild:
+            cmd.append("--no-cache")
+        cmd.append(str(tmp_path))
+        print(f"building {tag} ...", file=sys.stderr)
+        result = subprocess.run(cmd, check=False)
+        if result.returncode != 0:
+            raise InfraError(f"failed to build image {tag}")
+
+
+def resolve_image(config: Config) -> str:
+    tag = compute_image_tag(config.odoo_version, config.browser, config.requirements)
+    if tag.startswith("odoo-runner:"):
+        if config.rebuild or not image_exists(tag):
+            build_image(
+                tag,
+                config.odoo_version,
+                config.browser,
+                config.requirements,
+                config.rebuild,
+            )
+    else:
+        ensure_image_pulled(tag)
+    return tag
+
+
+def probe_with_demo(image: str) -> bool:
+    """Odoo 19 needs --with-demo; Odoo 18 loads demo by default. Feature-probe
+    instead of version-branching so a future odoo:20 works unmodified."""
+    result = subprocess.run(
+        ["docker", "run", "--rm", image, "odoo", "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return "--with-demo" in result.stdout
+
+
+def pick_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def pg_volume_name(project: str, version: str) -> str:
+    return f"odoo-runner-pg-{project}-{sanitize_docker_name(version)}"
+
+
+def fs_volume_name(project: str, version: str) -> str:
+    return f"odoo-runner-fs-{project}-{sanitize_docker_name(version)}"
+
+
+def create_network(run_id: str) -> str:
+    name = f"odoo-runner-net-{run_id}"
+    subprocess.run(
+        ["docker", "network", "create", "--label", LABEL_ARG, name],
+        check=True,
+        capture_output=True,
+    )
+    return name
+
+
+def start_postgres(
+    project: str, run_id: str, version: str, persist: bool, network: str
+) -> str:
+    container_name = f"odoo-runner-db-{run_id}"
+    cmd = [
+        "docker",
+        "run",
+        "-d",
+        "--rm",
+        "--name",
+        container_name,
+        "--network",
+        network,
+        "--network-alias",
+        "db",
+        "--label",
+        LABEL_ARG,
+        "-e",
+        "POSTGRES_USER=odoo",
+        "-e",
+        "POSTGRES_PASSWORD=odoo",
+    ]
+    if persist:
+        cmd += ["-v", f"{pg_volume_name(project, version)}:/var/lib/postgresql"]
+    else:
+        # postgres:18 moved PGDATA to /var/lib/postgresql/18/docker; mount the
+        # declared volume root, not .../data, so tmpfs covers it.
+        cmd += ["--tmpfs", "/var/lib/postgresql:rw,size=2g"]
+    cmd.append(PG_IMAGE)
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        raise InfraError(f"failed to start postgres: {result.stderr.strip()}")
+    return container_name
+
+
+def wait_for_postgres(container_name: str) -> None:
+    deadline = time.monotonic() + PG_WAIT_TIMEOUT_S
+    while time.monotonic() < deadline:
+        result = subprocess.run(
+            ["docker", "exec", container_name, "pg_isready", "-U", "odoo"],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return
+        time.sleep(PG_WAIT_INTERVAL_S)
+    raise InfraError(f"postgres did not become ready within {PG_WAIT_TIMEOUT_S}s")
+
+
+def check_db_exists(db_container: str, db_name: str) -> bool:
+    result = subprocess.run(
+        ["docker", "exec", db_container, "psql", "-U", "odoo", "-lqt"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    for line in result.stdout.splitlines():
+        if line.split("|")[0].strip() == db_name:
+            return True
+    return False
+
+
+# --- Log filtering / exit-code layering ------------------------------------
+
+
+def should_show_line(line: str) -> bool:
+    """Default (non-verbose) output: WARNING+ lines, odoo.tests.* lines, and
+    unittest failure/error block markers."""
+    match = LOG_LINE_RE.match(line)
+    if match:
+        return match.group("level") in ("WARNING", "ERROR", "CRITICAL") or match.group(
+            "logger"
+        ).startswith("odoo.tests")
+    stripped = line.strip()
+    return bool(
+        line.startswith(("FAIL:", "ERROR:", "Traceback", "  File "))
+        or re.match(r"^-{10,}$|^={10,}$", stripped)
+        or stripped.startswith(("FAILED (", "OK ("))
+    )
+
+
+def run_streamed(cmd: list[str], verbose: bool) -> tuple[int, Path]:
+    """Run a docker command, tee'ing full output to a temp log file while
+    printing a filtered (or full, if verbose) view to stdout."""
+    log_fd, log_path_str = tempfile.mkstemp(prefix="odoo-runner-", suffix=".log")
+    log_path = Path(log_path_str)
+    with os.fdopen(log_fd, "w") as log_file:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            log_file.write(line)
+            if verbose or should_show_line(line):
+                sys.stdout.write(line)
+        proc.wait()
+    return proc.returncode, log_path
+
+
+@dataclasses.dataclass
+class ScanResult:
+    force_fail: bool
+    reasons: list[str]
+    tests_run: int | None
+    tests_failed: int | None
+    skipped: int | None
+
+
+def scan_log(log_path: Path) -> ScanResult:
+    """Layer 2 of the exit-code strategy: force non-zero on error-shaped log
+    content even if the container itself exited 0."""
+    force_fail = False
+    reasons: list[str] = []
+    tests_run: int | None = None
+    tests_failed: int | None = None
+    skipped: int | None = None
+
+    summary_re = re.compile(r"(\d+) failed, (\d+) error(?:\(s\))? of (\d+) tests?")
+    ran_re = re.compile(r"^Ran (\d+) tests? in")
+    # Odoo's own OdooTestResult logs one "skipped <test> : <reason>" INFO
+    # line per skip (odoo/tests/result.py addSkip). The classic
+    # "OK (skipped=N)" unittest summary only shows up in subprocess-driven
+    # meta-tests (e.g. base's test_cli), so both patterns are counted.
+    skip_line_re = re.compile(r"^skipped \S+ :")
+    skip_summary_re = re.compile(r"skipped=(\d+)")
+    failed_marker_re = re.compile(r"FAILED \(")
+
+    for line in log_path.read_text(errors="replace").splitlines():
+        match = LOG_LINE_RE.match(line)
+        if match and match.group("level") in ("ERROR", "CRITICAL"):
+            force_fail = True
+            reasons.append(line.strip())
+        if line.startswith(("FAIL:", "ERROR:")):
+            force_fail = True
+            reasons.append(line.strip())
+        if "Failed to initialize database" in line:
+            force_fail = True
+            reasons.append(line.strip())
+        if failed_marker_re.search(line):
+            force_fail = True
+            reasons.append(line.strip())
+
+        summary_match = summary_re.search(line)
+        if summary_match:
+            failed, errors, total = (int(g) for g in summary_match.groups())
+            tests_run = total
+            tests_failed = failed + errors
+            if tests_failed > 0:
+                force_fail = True
+                reasons.append(line.strip())
+
+        ran_match = ran_re.search(line)
+        if ran_match and tests_run is None:
+            tests_run = int(ran_match.group(1))
+
+        if match and skip_line_re.match(match.group("msg")):
+            skipped = (skipped or 0) + 1
+
+        skip_summary_match = skip_summary_re.search(line)
+        if skip_summary_match:
+            skipped = (skipped or 0) + int(skip_summary_match.group(1))
+
+    return ScanResult(force_fail, reasons, tests_run, tests_failed, skipped)
+
+
+def report_verdict(rc: int, scan: ScanResult, log_path: Path, browser: bool) -> int:
+    """Apply layer 2/3 of the exit-code strategy and print the one-line verdict."""
+    final_rc = 1 if (scan.force_fail and rc == 0) else rc
+
+    if final_rc == 0 and scan.tests_run is None:
+        print(
+            "WARNING: no test summary detected in output; module may have no tests",
+            file=sys.stderr,
+        )
+    if scan.skipped:
+        note = "" if browser else " (HttpCase tests skip without --browser)"
+        print(f"WARNING: {scan.skipped} test(s) skipped{note}", file=sys.stderr)
+
+    verdict = "PASS" if final_rc == 0 else "FAIL"
+    if scan.tests_run is not None:
+        print(f"{verdict}: {scan.tests_run} tests, {scan.tests_failed or 0} failed")
+    else:
+        print(verdict)
+
+    if final_rc != 0:
+        print(f"full log: {log_path}", file=sys.stderr)
+    return final_rc
+
+
+# --- Runner ------------------------------------------------------------
+
+
+class Runner:
+    """Owns the lifecycle of one odoo-runner invocation's docker resources."""
+
+    def __init__(self, config: Config, addons_dir: Path, modules: list[str]) -> None:
+        self.config = config
+        self.addons_dir = addons_dir
+        self.modules = modules
+        self.run_id = uuid.uuid4().hex[:8]
+        self.project = sanitize_docker_name(addons_dir.name)
+        self.network: str | None = None
+        self.db_container: str | None = None
+        self.odoo_containers: list[str] = []
+
+    def teardown(self) -> None:
+        for name in self.odoo_containers:
+            subprocess.run(
+                ["docker", "rm", "-f", name], capture_output=True, check=False
+            )
+        if self.db_container:
+            subprocess.run(
+                ["docker", "rm", "-f", self.db_container],
+                capture_output=True,
+                check=False,
+            )
+        if self.network:
+            result = subprocess.run(
+                ["docker", "network", "rm", self.network],
+                capture_output=True,
+                check=False,
+            )
+            if result.returncode != 0:
+                # endpoint-detach race: containers can take a moment to fully
+                # disconnect after `docker rm -f`.
+                time.sleep(1)
+                subprocess.run(
+                    ["docker", "network", "rm", self.network],
+                    capture_output=True,
+                    check=False,
+                )
+
+    def run(self) -> int:
+        if self.config.mode == "demo":
+            return self._run_demo()
+        if self.config.mode == "shell":
+            return self._run_shell()
+        return self._run_test()
+
+    def _db_name(self) -> str:
+        return "odoo" if self.config.persist else f"odoo_{self.run_id}"
+
+    def _start_infra(self) -> None:
+        if self.config.fresh:
+            for volume in (
+                pg_volume_name(self.project, self.config.odoo_version),
+                fs_volume_name(self.project, self.config.odoo_version),
+            ):
+                subprocess.run(
+                    ["docker", "volume", "rm", volume], capture_output=True, check=False
+                )
+        self.network = create_network(self.run_id)
+        self.db_container = start_postgres(
+            self.project,
+            self.run_id,
+            self.config.odoo_version,
+            self.config.persist,
+            self.network,
+        )
+        wait_for_postgres(self.db_container)
+
+    def _base_run_args(
+        self, image: str, extra_mounts: list[str] | None = None
+    ) -> list[str]:
+        odoo_container_name = f"odoo-runner-odoo-{self.run_id}"
+        cmd = [
+            "docker",
+            "run",
+            "--rm",
+            "--name",
+            odoo_container_name,
+            "--network",
+            self.network,
+            "--label",
+            LABEL_ARG,
+            "-v",
+            f"{self.addons_dir}:/mnt/extra-addons:ro",
+            "-e",
+            "HOST=db",
+            "-e",
+            "USER=odoo",
+            "-e",
+            "PASSWORD=odoo",
+        ]
+        if extra_mounts:
+            cmd += extra_mounts
+        if self.config.browser:
+            cmd.append("--shm-size=1g")
+        self.odoo_containers.append(odoo_container_name)
+        cmd.append(image)
+        return cmd
+
+    def _effective_test_tags(self) -> str:
+        """Test-tags to pass to Odoo for this run.
+
+        Odoo's --test-enable gathers *every* module touched by the database
+        init (base and its transitive deps included) as test candidates, not
+        just the modules passed to -i/-u. Left unfiltered, that means any
+        first-ever test run also re-runs base's own bundled test suite. So,
+        unless the caller supplies an explicit --test-tags, scope the run to
+        just the target module(s) via the documented `/module` tag syntax.
+        """
+        if self.config.test_tags:
+            return self.config.test_tags
+        return ",".join(f"/{module}" for module in self.modules)
+
+    def _run_test(self) -> int:
+        self._start_infra()
+        image = resolve_image(self.config)
+        db_name = self._db_name()
+        modules_arg = ",".join(self.modules)
+        test_tags = self._effective_test_tags()
+
+        install_cmd = self._base_run_args(image)
+        install_cmd += ["odoo", "-d", db_name, "-i", modules_arg, "--test-enable"]
+        install_cmd += ["--test-tags", test_tags]
+        install_cmd += ["--stop-after-init", "--no-http", "--log-level=test"]
+
+        rc, log_path = run_streamed(install_cmd, self.config.verbose)
+        scan = scan_log(log_path)
+        final_rc = report_verdict(rc, scan, log_path, self.config.browser)
+
+        if final_rc != 0:
+            return EXIT_TEST_FAILURE
+        if not self.config.upgrade_test:
+            return EXIT_PASS
+
+        print("--upgrade-test: re-running with -u on the same database ...")
+        upgrade_cmd = self._base_run_args(image)
+        upgrade_cmd += ["odoo", "-d", db_name, "-u", modules_arg, "--test-enable"]
+        upgrade_cmd += ["--test-tags", test_tags]
+        upgrade_cmd += ["--stop-after-init", "--no-http", "--log-level=test"]
+
+        rc, log_path = run_streamed(upgrade_cmd, self.config.verbose)
+        scan = scan_log(log_path)
+        final_rc = report_verdict(rc, scan, log_path, self.config.browser)
+        return EXIT_PASS if final_rc == 0 else EXIT_TEST_FAILURE
+
+    def _run_demo(self) -> int:
+        self._start_infra()
+        image = resolve_image(self.config)
+        with_demo = probe_with_demo(image)
+        port = self.config.port or pick_free_port()
+        db_name = self._db_name()
+        modules_arg = ",".join(self.modules)
+
+        extra_mounts = ["-p", f"{port}:8069"]
+        if self.config.persist:
+            extra_mounts += [
+                "-v",
+                f"{fs_volume_name(self.project, self.config.odoo_version)}:/var/lib/odoo",
+            ]
+
+        cmd = self._base_run_args(image, extra_mounts)
+        # -d/--rm here launches detached; we stream logs separately and tear
+        # down the container on Ctrl-C / SIGTERM.
+        cmd.insert(2, "-d")
+        cmd += ["odoo", "-d", db_name, "-i", modules_arg]
+        if with_demo:
+            cmd.append("--with-demo")
+
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+        if result.returncode != 0:
+            raise InfraError(f"failed to start demo container: {result.stderr.strip()}")
+
+        print("odoo-runner demo is up:")
+        print(f"  URL:     http://localhost:{port}/odoo")
+        print("  Login:   admin / admin")
+        print(f"  Modules: {modules_arg}")
+        print("  Press Ctrl-C to stop and tear down.")
+
+        container_name = self.odoo_containers[-1]
+        logs_proc = subprocess.Popen(["docker", "logs", "-f", container_name])
+        try:
+            logs_proc.wait()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            logs_proc.terminate()
+        return EXIT_PASS
+
+    def _run_shell(self) -> int:
+        self._start_infra()
+        image = resolve_image(self.config)
+        db_name = self._db_name()
+        modules_arg = ",".join(self.modules)
+
+        if not check_db_exists(self.db_container, db_name):
+            print(
+                f"database {db_name!r} not found; installing {modules_arg} quietly ...",
+                file=sys.stderr,
+            )
+            install_cmd = self._base_run_args(image)
+            install_cmd += ["odoo", "-d", db_name, "-i", modules_arg]
+            install_cmd += ["--stop-after-init", "--no-http", "--log-level=warn"]
+            result = subprocess.run(install_cmd, check=False)
+            if result.returncode != 0:
+                raise InfraError("quiet install failed before shell")
+
+        shell_container_name = f"odoo-runner-shell-{self.run_id}"
+        self.odoo_containers.append(shell_container_name)
+        shell_cmd = [
+            "docker",
+            "run",
+            "-it",
+            "--rm",
+            "--name",
+            shell_container_name,
+            "--network",
+            self.network,
+            "--label",
+            LABEL_ARG,
+            "-v",
+            f"{self.addons_dir}:/mnt/extra-addons:ro",
+            "-e",
+            "HOST=db",
+            "-e",
+            "USER=odoo",
+            "-e",
+            "PASSWORD=odoo",
+            image,
+            "odoo",
+            "shell",
+            "-d",
+            db_name,
+            "--no-http",
+        ]
+        result = subprocess.run(shell_cmd, check=False)
+        return result.returncode
+
+
+# --- CLI ------------------------------------------------------------------
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="odoo-runner",
+        description="Disposable Docker runner for Odoo module tests, upgrades, demos, and shells.",
+    )
+    parser.add_argument(
+        "--dir", metavar="PATH", help="Addons dir or single module dir. Default: cwd."
+    )
+    parser.add_argument(
+        "--modules",
+        metavar="A,B",
+        help="Comma-separated module list. Default: auto-discovered.",
+    )
+    parser.add_argument(
+        "--requirements",
+        metavar="FILE",
+        help="Default: auto-detect <dir>/requirements.txt.",
+    )
+    parser.add_argument(
+        "--odoo",
+        metavar="VER",
+        help="Odoo image tag/version. Default: ODOO_RUNNER_ODOO_VERSION or 'latest'.",
+    )
+
+    mode_group = parser.add_mutually_exclusive_group()
+    mode_group.add_argument(
+        "--demo", action="store_true", help="Run a live demo server instead of tests."
+    )
+    mode_group.add_argument(
+        "--shell",
+        action="store_true",
+        help="Open an interactive odoo shell instead of tests.",
+    )
+
+    parser.add_argument(
+        "--test-tags", metavar="SPECS", help="Passthrough to odoo --test-tags."
+    )
+    parser.add_argument(
+        "--upgrade-test",
+        action="store_true",
+        help="After install+test passes, re-run with -u + tests.",
+    )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help="Browser-enabled derived image (Chrome for HttpCase/tours).",
+    )
+    parser.add_argument(
+        "--port", type=int, metavar="N", help="Demo port. Default: auto-pick free port."
+    )
+    parser.add_argument(
+        "--persist",
+        action="store_true",
+        help="Use named volumes keyed by project+version.",
+    )
+    parser.add_argument(
+        "--fresh", action="store_true", help="Wipe named volumes before starting."
+    )
+    parser.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="Force derived-image rebuild (--no-cache).",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Stream full log instead of filtered output.",
+    )
+    parser.add_argument("--dry-run", action="store_true", help=argparse.SUPPRESS)
+    return parser
+
+
+def print_plan(
+    config: Config, addons_dir: Path, modules: list[str], image_tag: str
+) -> None:
+    print("odoo-runner resolved plan (--dry-run)")
+    print(f"  mode:          {config.mode}")
+    print(f"  dir:           {config.dir}")
+    print(f"  addons_dir:    {addons_dir}")
+    print(f"  modules:       {', '.join(modules)}")
+    print(f"  requirements:  {config.requirements or '(none)'}")
+    print(f"  odoo_version:  {config.odoo_version}")
+    print(f"  image:         {image_tag}")
+    effective_test_tags = config.test_tags or ",".join(f"/{m}" for m in modules)
+    print(f"  test_tags:     {effective_test_tags} (test mode only)")
+    print(f"  upgrade_test:  {config.upgrade_test}")
+    print(f"  browser:       {config.browser}")
+    print(f"  port:          {config.port if config.port is not None else '(auto)'}")
+    print(f"  persist:       {config.persist}")
+    print(f"  fresh:         {config.fresh}")
+    print(f"  rebuild:       {config.rebuild}")
+    print(f"  verbose:       {config.verbose}")
+
+
+def install_sigterm_handler() -> None:
+    def _handler(signum: int, frame: object) -> None:
+        raise SystemExit(143)  # 128 + SIGTERM, conventional shell exit code
+
+    signal.signal(signal.SIGTERM, _handler)
+
+
+def main() -> int:
+    # Force line buffering even when stdout/stderr are redirected to a file
+    # or pipe (not a TTY), so streamed test/demo output appears in real
+    # time instead of arriving in one block at process exit.
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+    install_sigterm_handler()
+    parser = build_parser()
+    args = parser.parse_args()
+
+    try:
+        config, addons_dir, modules = build_config(args)
+    except ConfigError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_USAGE_ERROR
+
+    if not docker_available():
+        print(
+            "error: docker is not available or the daemon is not running",
+            file=sys.stderr,
+        )
+        return EXIT_INFRA_ERROR
+
+    if config.dry_run:
+        image_tag = compute_image_tag(
+            config.odoo_version, config.browser, config.requirements
+        )
+        print_plan(config, addons_dir, modules, image_tag)
+        return EXIT_PASS
+
+    runner = Runner(config, addons_dir, modules)
+    try:
+        return runner.run()
+    except InfraError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return EXIT_INFRA_ERROR
+    except KeyboardInterrupt:
+        print("\ninterrupted, tearing down ...", file=sys.stderr)
+        return 130
+    except SystemExit as exc:
+        print("\nterminated, tearing down ...", file=sys.stderr)
+        return exc.code if isinstance(exc.code, int) else 143
+    finally:
+        runner.teardown()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

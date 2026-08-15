@@ -1,0 +1,75 @@
+name: odoo-runner
+description: >-
+  Run Odoo module tests in a disposable Docker environment
+  (official odoo image + tmpfs Postgres). Exit code is the verdict.
+author: JorDunn
+branding:
+  icon: check-circle
+  color: purple
+
+inputs:
+  odoo-version:
+    description: >-
+      Odoo image tag to test against ("18", "19.0", ...). Passed to
+      --odoo. Falls back to ODOO_RUNNER_ODOO_VERSION from the module
+      repo's .env when empty.
+    required: false
+    default: ""
+  dir:
+    description: Addons dir or single module dir. Passed to --dir.
+    required: false
+    default: "."
+  modules:
+    description: Comma-separated module list. Default is auto-discovery.
+    required: false
+    default: ""
+  test-tags:
+    description: Test filter passed to --test-tags.
+    required: false
+    default: ""
+  requirements:
+    description: Path to a requirements file. Default is auto-detection.
+    required: false
+    default: ""
+  browser:
+    description: Set "true" to run HttpCase/tour tests with Chrome.
+    required: false
+    default: "false"
+  upgrade-test:
+    description: Set "true" to re-run with -u after the install run passes.
+    required: false
+    default: "false"
+  verbose:
+    description: Set "true" to stream the full Odoo log.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Install uv
+      uses: astral-sh/setup-uv@v5
+
+    - name: Run odoo-runner
+      shell: bash
+      # Inputs are passed through env, not inline interpolation, so
+      # attacker-controlled values cannot inject into the shell script.
+      env:
+        IN_ODOO_VERSION: ${{ inputs.odoo-version }}
+        IN_DIR: ${{ inputs.dir }}
+        IN_MODULES: ${{ inputs.modules }}
+        IN_TEST_TAGS: ${{ inputs.test-tags }}
+        IN_REQUIREMENTS: ${{ inputs.requirements }}
+        IN_BROWSER: ${{ inputs.browser }}
+        IN_UPGRADE_TEST: ${{ inputs.upgrade-test }}
+        IN_VERBOSE: ${{ inputs.verbose }}
+      run: |
+        args=(--dir "${IN_DIR}")
+        [[ -n "${IN_ODOO_VERSION}" ]] && args+=(--odoo "${IN_ODOO_VERSION}")
+        [[ -n "${IN_MODULES}" ]] && args+=(--modules "${IN_MODULES}")
+        [[ -n "${IN_TEST_TAGS}" ]] && args+=(--test-tags "${IN_TEST_TAGS}")
+        [[ -n "${IN_REQUIREMENTS}" ]] && args+=(--requirements "${IN_REQUIREMENTS}")
+        [[ "${IN_BROWSER}" == "true" ]] && args+=(--browser)
+        [[ "${IN_UPGRADE_TEST}" == "true" ]] && args+=(--upgrade-test)
+        [[ "${IN_VERBOSE}" == "true" ]] && args+=(--verbose)
+        "${GITHUB_ACTION_PATH}/odoo-runner" "${args[@]}"
