@@ -292,6 +292,12 @@ jobs:
 | `browser` | `--browser` | `"false"` |
 | `upgrade-test` | `--upgrade-test` | `"false"` |
 | `verbose` | `--verbose` | `"false"` |
+| `odoo-args` | Arguments after `--` | (none) |
+
+Set `odoo-args` to send more Odoo server options, for example
+`"--log-sql --log-handler=odoo.orm:DEBUG"`. The action divides the
+value at each space and sends the parts after `--` to odoo-runner.
+Refer to "Odoo server options" above for the blocked options.
 
 Set `browser` and `upgrade-test` to the string `"true"` to enable them.
 If your repository holds a `.env` file with `ODOO_RUNNER_ODOO_VERSION`,

@@ -81,6 +81,8 @@ technical_nouns:
   - word: installation
     inflections: [installations]
   - word: development
+  - word: action
+    inflections: [actions]
 technical_verbs:
   - word: install
     inflections: [installs, installed, installing]

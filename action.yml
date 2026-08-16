@@ -43,6 +43,13 @@ inputs:
     description: Set "true" to stream the full Odoo log.
     required: false
     default: "false"
+  odoo-args:
+    description: >-
+      Extra Odoo server options, passed after the "--" separator
+      (e.g. "--log-sql --log-handler=odoo.orm:DEBUG"). Split on
+      spaces; odoo-runner rejects contract-owned flags and --dev.
+    required: false
+    default: ""
 
 runs:
   using: composite
@@ -63,6 +70,7 @@ runs:
         IN_BROWSER: ${{ inputs.browser }}
         IN_UPGRADE_TEST: ${{ inputs.upgrade-test }}
         IN_VERBOSE: ${{ inputs.verbose }}
+        IN_ODOO_ARGS: ${{ inputs.odoo-args }}
       run: |
         args=(--dir "${IN_DIR}")
         [[ -n "${IN_ODOO_VERSION}" ]] && args+=(--odoo "${IN_ODOO_VERSION}")
@@ -72,4 +80,10 @@ runs:
         [[ "${IN_BROWSER}" == "true" ]] && args+=(--browser)
         [[ "${IN_UPGRADE_TEST}" == "true" ]] && args+=(--upgrade-test)
         [[ "${IN_VERBOSE}" == "true" ]] && args+=(--verbose)
+        if [[ -n "${IN_ODOO_ARGS}" ]]; then
+          # read -ra splits on whitespace without glob expansion or eval,
+          # so a hostile input value cannot expand into the filesystem.
+          read -ra odoo_args <<< "${IN_ODOO_ARGS}"
+          args+=(-- "${odoo_args[@]}")
+        fi
         "${GITHUB_ACTION_PATH}/odoo-runner" "${args[@]}"
