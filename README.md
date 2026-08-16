@@ -153,6 +153,56 @@ odoo-runner finds this file and builds a custom image with the packages
 installed. You do not need a flag for this. Use `--requirements FILE` only
 to point odoo-runner at a file in a different location.
 
+### Odoo server options
+
+Write `--` after the odoo-runner options. odoo-runner sends all the
+arguments after `--` to the Odoo server in the container. You can use
+`--` in test mode, demo mode, and shell mode.
+
+Examples:
+
+```sh
+# Show debug log lines for one Python module. You can give
+# --log-handler more than one time.
+odoo-runner --dir path/to/my_module --odoo 19.0 -- --log-handler=odoo.orm:DEBUG
+
+# Show each SQL query in demo mode.
+odoo-runner --dir path/to/my_module --odoo 19.0 --demo -- --log-sql
+
+# Increase the time limits for long operations.
+odoo-runner --dir path/to/my_module --odoo 19.0 --demo -- --limit-time-cpu=600 --limit-time-real=1200
+```
+
+#### Option precedence
+
+odoo-runner puts your options at the end of the Odoo command. When one
+option occurs two times, Odoo uses the last value. Your value thus
+replaces the odoo-runner default. For example, in test mode
+`-- --log-level=debug` replaces the default `--log-level=test`.
+
+Some options collect values, for example `--log-handler`. These options
+do not replace each other. You can give them more than one time.
+
+In shell mode, odoo-runner sends your options only to the shell process.
+odoo-runner does not send your options to the first installation step.
+
+#### Blocked options
+
+Some Odoo options are necessary for correct odoo-runner operation.
+odoo-runner does not accept these options after `--`. It stops with exit
+code `2` and shows the cause.
+
+| Blocked option | Correct procedure |
+| --- | --- |
+| `--dev` | Do not use. odoo-runner is not a development server. |
+| `-d`, `--database` | Do not use. odoo-runner sets the database name. |
+| `-i`, `--init` | Use the `--modules` flag. |
+| `-u`, `--update` | Use the `--upgrade-test` flag. |
+| `--test-enable` | Do not use. odoo-runner starts the tests. |
+| `--test-tags` | Use the odoo-runner `--test-tags` flag. |
+| `--stop-after-init`, `--no-http` | Do not use. odoo-runner sets these options. |
+| `-p`, `--http-port`, `--xmlrpc-port` | Use the `--port` flag. |
+
 ## GitHub Actions
 
 This repository is also a composite GitHub Action. Use it to run your
@@ -295,7 +345,8 @@ can read this code without parsing output text.
 - **odoo-runner mounts your module code read-only.** odoo-runner never
   writes back to your module files. It is not a development server. It
   does not reload code when you edit a file. Restart the run to test a
-  change.
+  change. odoo-runner also does not accept the Odoo `--dev` option
+  after `--`.
 - **`HttpCase` tests skip without `--browser`.** Odoo skips
   `HttpCase`-based tests when no browser is present. odoo-runner warns you
   when it detects skipped tests. Add `--browser` to run them.

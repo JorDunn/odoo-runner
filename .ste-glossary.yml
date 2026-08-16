@@ -1,0 +1,95 @@
+name: odoo-runner
+technical_nouns:
+  - word: Odoo
+    inflections: [odoo, Odoo's]
+  - word: odoo-runner
+  - word: runner
+    inflections: [runners]
+  - word: Docker
+    inflections: [docker]
+  - word: uv
+  - word: Postgres
+    inflections: [PostgreSQL, postgres]
+  - word: GitHub
+  - word: Ubuntu
+  - word: Chrome
+  - word: HttpCase
+  - word: Python
+  - word: module
+    inflections: [modules]
+  - word: addons
+  - word: manifest
+  - word: server
+    inflections: [servers]
+  - word: option
+    inflections: [options]
+  - word: demo
+    inflections: [demos]
+  - word: shell
+    inflections: [shells]
+  - word: browser
+    inflections: [browsers]
+  - word: database
+    inflections: [databases]
+  - word: directory
+    inflections: [directories]
+  - word: repository
+    inflections: [repositories]
+  - word: image
+    inflections: [images]
+  - word: version
+    inflections: [versions]
+  - word: flag
+    inflections: [flags]
+  - word: port
+    inflections: [ports]
+  - word: command
+    inflections: [commands]
+  - word: command line
+  - word: default
+    inflections: [defaults]
+  - word: precedence
+  - word: lifecycle
+  - word: process
+    inflections: [processes]
+  - word: filestore
+  - word: tmpfs
+  - word: volume
+    inflections: [volumes]
+  - word: container
+    inflections: [containers]
+  - word: network
+    inflections: [networks]
+  - word: label
+    inflections: [labels]
+  - word: login
+  - word: URL
+  - word: CI
+  - word: amd64
+  - word: arm64
+  - word: tour
+    inflections: [tours]
+  - word: SQL
+  - word: query
+    inflections: [queries]
+  - word: workflow
+    inflections: [workflows]
+  - word: tag
+    inflections: [tags]
+  - word: argument
+    inflections: [arguments]
+  - word: installation
+    inflections: [installations]
+  - word: development
+technical_verbs:
+  - word: install
+    inflections: [installs, installed, installing]
+  - word: run
+    inflections: [runs, ran, running]
+  - word: test
+    inflections: [tests, tested, testing]
+  - word: mount
+    inflections: [mounts, mounted]
+  - word: clone
+    inflections: [clones, cloned]
+preferred_terms: {}

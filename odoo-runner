@@ -83,6 +83,27 @@ RUN pip3 install --no-cache-dir -r /tmp/requirements.txt
 """
 
 
+# Passthrough flags (everything after `--`) that would break the runner's
+# contract, mapped to the reason shown to the user. `--dev` is a policy
+# block: odoo-runner is a disposable validation tool, not a dev server.
+BLOCKED_ODOO_ARGS = {
+    "--dev": "odoo-runner is not a development server; modules mount read-only",
+    "-d": "the runner owns the database name",
+    "--database": "the runner owns the database name",
+    "-i": "use --modules to choose modules",
+    "--init": "use --modules to choose modules",
+    "-u": "use --upgrade-test to run an upgrade pass",
+    "--update": "use --upgrade-test to run an upgrade pass",
+    "--test-enable": "the runner owns the test lifecycle",
+    "--test-tags": "use the runner's own --test-tags flag",
+    "--stop-after-init": "the runner owns the process lifecycle",
+    "--no-http": "the runner owns the HTTP lifecycle per mode",
+    "-p": "use --port to choose the demo port",
+    "--http-port": "use --port to choose the demo port",
+    "--xmlrpc-port": "use --port to choose the demo port",
+}
+
+
 class ConfigError(Exception):
     """Bad CLI input or resolved configuration. Maps to exit code 2."""
 
@@ -112,6 +133,7 @@ class Config:
     rebuild: bool
     verbose: bool
     dry_run: bool
+    odoo_args: list[str]
 
 
 def parse_env_file(path: Path) -> dict[str, str]:
@@ -139,6 +161,29 @@ def _resolve(cli_value: str | None, env_key: str, dotenv: dict[str, str]) -> str
     if env_key in os.environ:
         return os.environ[env_key]
     return dotenv.get(env_key)
+
+
+def split_passthrough(argv: list[str]) -> tuple[list[str], list[str]]:
+    """Split argv at the first bare `--` into (runner_args, odoo_args)."""
+    if "--" in argv:
+        index = argv.index("--")
+        return argv[:index], argv[index + 1 :]
+    return argv, []
+
+
+def validate_odoo_args(odoo_args: list[str]) -> None:
+    """Reject passthrough flags that collide with runner-owned plumbing."""
+    for token in odoo_args:
+        if not token.startswith("-"):
+            continue
+        flag = token.split("=", 1)[0]
+        is_short_with_value = not flag.startswith("--") and len(flag) > 2
+        if flag not in BLOCKED_ODOO_ARGS and is_short_with_value:
+            flag = flag[:2]  # short option with an attached value, e.g. -dmydb
+        if flag in BLOCKED_ODOO_ARGS:
+            raise ConfigError(
+                f"passthrough flag '{flag}' is not allowed: {BLOCKED_ODOO_ARGS[flag]}"
+            )
 
 
 def sanitize_docker_name(name: str) -> str:
@@ -181,8 +226,11 @@ def discover_modules(addons_dir: Path) -> list[str]:
     return modules
 
 
-def build_config(args: argparse.Namespace) -> tuple[Config, Path, list[str]]:
+def build_config(
+    args: argparse.Namespace, odoo_args: list[str]
+) -> tuple[Config, Path, list[str]]:
     """Resolve CLI args + env + .env into a Config, addons_dir, and module list."""
+    validate_odoo_args(odoo_args)
     dir_arg = Path(args.dir or ".").resolve()
     if not dir_arg.is_dir():
         raise ConfigError(f"--dir {dir_arg} does not exist or is not a directory")
@@ -256,6 +304,7 @@ def build_config(args: argparse.Namespace) -> tuple[Config, Path, list[str]]:
         rebuild=args.rebuild,
         verbose=args.verbose,
         dry_run=args.dry_run,
+        odoo_args=odoo_args,
     )
     return config, addons_dir, modules
 
@@ -695,6 +744,9 @@ class Runner:
         install_cmd += ["odoo", "-d", db_name, "-i", modules_arg, "--test-enable"]
         install_cmd += ["--test-tags", test_tags]
         install_cmd += ["--stop-after-init", "--no-http", "--log-level=test"]
+        # Passthrough goes last: odoo's optparse takes the last value for
+        # scalar options, so e.g. a passthrough --log-level overrides ours.
+        install_cmd += self.config.odoo_args
 
         rc, log_path = run_streamed(install_cmd, self.config.verbose)
         scan = scan_log(log_path)
@@ -710,6 +762,7 @@ class Runner:
         upgrade_cmd += ["odoo", "-d", db_name, "-u", modules_arg, "--test-enable"]
         upgrade_cmd += ["--test-tags", test_tags]
         upgrade_cmd += ["--stop-after-init", "--no-http", "--log-level=test"]
+        upgrade_cmd += self.config.odoo_args
 
         rc, log_path = run_streamed(upgrade_cmd, self.config.verbose)
         scan = scan_log(log_path)
@@ -738,6 +791,7 @@ class Runner:
         cmd += ["odoo", "-d", db_name, "-i", modules_arg]
         if with_demo:
             cmd.append("--with-demo")
+        cmd += self.config.odoo_args
 
         result = subprocess.run(cmd, capture_output=True, text=True, check=False)
         if result.returncode != 0:
@@ -805,6 +859,9 @@ class Runner:
             db_name,
             "--no-http",
         ]
+        # The quiet bootstrap install above stays runner-owned; passthrough
+        # only reaches the interactive shell process itself.
+        shell_cmd += self.config.odoo_args
         result = subprocess.run(shell_cmd, check=False)
         return result.returncode
 
@@ -816,6 +873,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="odoo-runner",
         description="Disposable Docker runner for Odoo module tests, upgrades, demos, and shells.",
+        epilog=(
+            "Arguments after a bare `--` pass through to the odoo process, "
+            "e.g. `odoo-runner --demo -- --log-sql --log-handler=odoo.orm:DEBUG`. "
+            "Flags the runner owns (-d, -i/-u, --test-enable, --test-tags, "
+            "--stop-after-init, --no-http, ports) and --dev are rejected."
+        ),
     )
     parser.add_argument(
         "--dir", metavar="PATH", help="Addons dir or single module dir. Default: cwd."
@@ -904,6 +967,7 @@ def print_plan(
     print(f"  fresh:         {config.fresh}")
     print(f"  rebuild:       {config.rebuild}")
     print(f"  verbose:       {config.verbose}")
+    print(f"  odoo_args:     {' '.join(config.odoo_args) or '(none)'}")
 
 
 def install_sigterm_handler() -> None:
@@ -921,10 +985,11 @@ def main() -> int:
     sys.stderr.reconfigure(line_buffering=True)
     install_sigterm_handler()
     parser = build_parser()
-    args = parser.parse_args()
+    runner_argv, odoo_args = split_passthrough(sys.argv[1:])
+    args = parser.parse_args(runner_argv)
 
     try:
-        config, addons_dir, modules = build_config(args)
+        config, addons_dir, modules = build_config(args, odoo_args)
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return EXIT_USAGE_ERROR
