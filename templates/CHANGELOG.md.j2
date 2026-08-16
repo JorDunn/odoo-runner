@@ -1,0 +1,130 @@
+{#  Keep a Changelog renderer for the odoo-runner repository.
+
+    python-semantic-release renders every non-hidden *.j2 under
+    [tool.semantic_release.changelog] template_dir to the matching path at the
+    repository root. This file therefore writes CHANGELOG.md.
+
+    Headings are the tag (tag_format applied), e.g.
+        ## [v1.2.0] - 2026-08-15
+
+    Conventional commit types map onto Keep a Changelog sections:
+        feat                  -> Added
+        perf, refactor        -> Changed
+        BREAKING CHANGE       -> Changed (prefixed **BREAKING**)
+        revert                -> Removed
+        fix                   -> Fixed
+    Everything else (docs, chore, ci, test, style, build) is excluded.
+
+    Mode "update" keeps the hand-written preamble above the insertion flag.
+#}{%  set insertion_flag = ctx.changelog_insertion_flag
+%}{%  set releases = ctx.history.released.values() | list
+%}{%  set section_order = ["Added", "Changed", "Removed", "Fixed"]
+%}{%  set type_to_section = {
+        "features": "Added",
+        "performance improvements": "Changed",
+        "refactoring": "Changed",
+        "revert": "Removed",
+        "bug fixes": "Fixed",
+      }
+%}{#
+   #  MACRO: render one release as a Keep a Changelog block
+#}{%  macro render_release(release)
+%}{%    set buckets = {"Added": [], "Changed": [], "Removed": [], "Fixed": []}
+%}{%    set breaking = []
+%}{#
+#}{%    for commit_type, commits in release["elements"] | dictsort
+%}{%      for commit in commits
+%}{%        if commit.error is undefined
+%}{%          set summary = (commit.descriptions[0] | trim)
+%}{%          set summary = (summary[0] | upper) ~ summary[1:]
+%}{%          if commit.scope
+%}{%            set summary = "**%s**: %s" | format(commit.scope, summary)
+%}{%          endif
+%}{#
+#}{%          if commit_type in type_to_section
+%}{%            set _ = buckets[type_to_section[commit_type]].append(
+                  "- %s (`%s`)" | format(summary, commit.short_hash)
+                )
+%}{%          endif
+%}{#
+#}{%          for description in commit.breaking_descriptions
+%}{%            if description | trim
+%}{%              set breaking_text = description | trim
+%}{%              set breaking_text = (breaking_text[0] | upper) ~ breaking_text[1:]
+%}{%              set _ = breaking.append(
+                    "- **BREAKING**: %s (`%s`)" | format(breaking_text, commit.short_hash)
+                  )
+%}{%            endif
+%}{%          endfor
+%}{%        endif
+%}{%      endfor
+%}{%    endfor
+%}{#
+#}{%    set _ = buckets.update({"Changed": breaking + buckets["Changed"]})
+%}{#
+#}{{    "## [%s] - %s\n" | format(
+          release.version.as_tag(),
+          release.tagged_date.strftime("%Y-%m-%d")
+        )
+}}{%    for section in section_order
+%}{%      if buckets[section] | length > 0
+%}{{        "\n### %s\n\n%s\n" | format(section, buckets[section] | unique | join("\n"))
+}}{%      endif
+%}{%    endfor
+%}{%    if buckets.values() | map("length") | sum == 0
+%}{{      "\n### Changed\n\n- Maintenance release; no user-facing changes.\n"
+}}{%    endif
+%}{%  endmacro
+%}{#
+   #  MACRO: full changelog body, used when no previous file exists
+#}{%  macro render_all_releases()
+%}{%    for release in releases
+%}{{      "\n"
+}}{{      render_release(release)
+}}{%    endfor
+%}{%  endmacro
+%}{#
+   #  ---------------------------------------------------------------------
+   #  Document
+   #  ---------------------------------------------------------------------
+#}{%  set previous_contents = ctx.prev_changelog_file | read_file | safe
+%}{%  set parts = previous_contents.split(insertion_flag, maxsplit=1)
+%}{#
+#}{%  if parts | length < 2
+%}{#    No insertion flag in the current file.
+#}{%    if previous_contents | length > 0
+%}{#      The file exists but was edited past recognition; leave it alone.
+#}{{      parts[0]
+}}{%    else
+%}{#      No file at all: write a minimal Keep a Changelog document.
+#}{{      "# Changelog\n"
+}}{{      "\nThis file gives the change history of odoo-runner.\n"
+}}{{      "\nThe format agrees with [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).\n"
+}}{{      "\n%s\n" | format(insertion_flag)
+}}{{      render_all_releases()
+}}{%    endif
+%}{%  else
+%}{#    Preamble (everything above the flag), then the flag itself.
+#}{%    set preamble = parts[0] | trim
+%}{%    if preamble | length > 0
+%}{{      "%s\n\n%s\n" | format(preamble, insertion_flag | trim)
+}}{%    else
+%}{{      "%s\n" | format(insertion_flag | trim)
+}}{%    endif
+%}{#
+   #    Insert the newest release, unless it is already recorded below.
+#}{%    if releases | length > 0
+%}{%      set release = releases[0]
+%}{%      if "## [" ~ release.version.as_tag() ~ "]" not in parts[1]
+%}{{        "\n"
+}}{{        render_release(release)
+}}{%      endif
+%}{%    endif
+%}{#
+   #    Everything that was already below the flag.
+#}{%    set tail = parts[1] | trim
+%}{%    if tail | length > 0
+%}{{      "\n%s\n" | format(tail)
+}}{%    endif
+%}{%  endif
+%}

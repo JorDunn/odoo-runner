@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   selftest:
     name: selftest (odoo ${{ matrix.odoo }})
@@ -51,3 +54,61 @@ jobs:
       - uses: astral-sh/setup-uv@v5
       - run: uvx ruff check odoo-runner
       - run: uvx ruff format --check odoo-runner
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: [selftest, lint]
+    if: github.event_name == 'push'
+    concurrency:
+      group: ${{ github.workflow }}-release-${{ github.ref_name }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          ref: ${{ github.ref_name }}
+
+      # Guard against commits pushed after this run was queued.
+      - name: Pin to triggering commit
+        run: git reset --hard ${{ github.sha }}
+
+      - uses: astral-sh/setup-uv@v5
+
+      # python-semantic-release computes the next version from Conventional
+      # Commits, stamps pyproject.toml, regenerates CHANGELOG.md, commits,
+      # tags vX.Y.Z, and creates the GitHub Release. When no commit warrants
+      # a bump it exits 0 without tagging and the steps below are skipped.
+      - name: Semantic release
+        id: release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@users.noreply.github.com"
+          before="$(git describe --tags --abbrev=0 --match 'v*.*.*' 2>/dev/null || true)"
+          uvx --from "python-semantic-release>=10.6,<11" semantic-release version
+          after="$(git describe --tags --abbrev=0 --match 'v*.*.*' 2>/dev/null || true)"
+          if [ -n "$after" ] && [ "$after" != "$before" ]; then
+            {
+              echo "released=true"
+              echo "tag=$after"
+            } >> "$GITHUB_OUTPUT"
+          else
+            echo "released=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Actions convention: the floating major tag (v1, v2, ...) follows the
+      # newest release inside that major, so `uses: JorDunn/odoo-runner@v1`
+      # consumers get every backward-compatible release automatically.
+      - name: Move the floating major tag
+        if: steps.release.outputs.released == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          major="${TAG%%.*}"
+          git tag -f "$major" "$TAG"
+          git push -f origin "$major"

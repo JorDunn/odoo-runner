@@ -1,0 +1,55 @@
+# This file exists only to carry the python-semantic-release configuration
+# and the released version. odoo-runner itself is a uv script, not a pip
+# package; its inline script metadata is in the odoo-runner file.
+[project]
+name = "odoo-runner"
+version = "1.1.0"
+description = "Disposable Docker runner for Odoo module tests, demos, and shells"
+
+[tool.semantic_release]
+version_toml = ["pyproject.toml:project.version"]
+tag_format = "v{version}"
+commit_message = "chore(release): {version} [skip ci]"
+allow_zero_version = false
+
+[tool.semantic_release.branches.release]
+match = "main"
+
+[tool.semantic_release.commit_parser_options]
+# 'revert' is not in PSR's default allowed_tags; it is added here so revert
+# commits parse and land in the changelog's "Removed" section.
+allowed_tags = [
+    "feat",
+    "fix",
+    "perf",
+    "refactor",
+    "revert",
+    "build",
+    "chore",
+    "ci",
+    "docs",
+    "style",
+    "test",
+]
+minor_tags = ["feat"]
+patch_tags = ["fix", "perf"]
+
+[tool.semantic_release.changelog]
+# templates/ holds the Keep a Changelog renderer. Because that directory is
+# non-empty, PSR renders every non-hidden *.j2 in it to the matching path at
+# the repo root and does NOT use its built-in changelog template.
+template_dir = "templates"
+mode = "update"
+insertion_flag = "<!-- version list -->"
+
+[tool.semantic_release.changelog.default_templates]
+# With a custom template_dir this value is not an output path; PSR passes it
+# to the template as ctx.prev_changelog_file so update mode can read the
+# current changelog. It must match the path the template renders to.
+changelog_file = "CHANGELOG.md"
+output_format = "md"
+mask_initial_release = false
+
+[tool.semantic_release.publish]
+upload_to_vcs_release = true
+dist_glob_patterns = []
