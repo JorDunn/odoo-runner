@@ -3,7 +3,7 @@
 # package; its inline script metadata is in the odoo-runner file.
 [project]
 name = "odoo-runner"
-version = "1.1.0"
+version = "1.1.1"
 description = "Disposable Docker runner for Odoo module tests, demos, and shells"
 
 [tool.semantic_release]
