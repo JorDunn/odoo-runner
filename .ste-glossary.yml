@@ -83,6 +83,23 @@ technical_nouns:
   - word: development
   - word: action
     inflections: [actions]
+  - word: pip
+  - word: dpkg
+  - word: package
+    inflections: [packages]
+  - word: file
+    inflections: [files]
+  - word: RECORD
+  - word: requirements.txt
+  - word: httpx
+  - word: typing_extensions
+  - word: DOCKERFILE_TEMPLATE_VERSION
+  - word: --ignore-installed
+    inflections: [--ignore]
+  - word: cache
+    inflections: [cached]
+  - word: build
+    inflections: [builds]
 technical_verbs:
   - word: install
     inflections: [installs, installed, installing]
@@ -94,4 +111,6 @@ technical_verbs:
     inflections: [mounts, mounted]
   - word: clone
     inflections: [clones, cloned]
+  - word: build
+    inflections: [builds, built, building]
 preferred_terms: {}
